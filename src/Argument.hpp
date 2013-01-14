@@ -71,8 +71,17 @@ struct Argument
 		filtering,
 		reconstruction,
 		capacitated,
+		lagrangian,
+		mip_solver,
+		moga,
 		num_individuals,
 		num_generations,
+		grasp,
+		num_directions,
+		local_search,
+		search_depth,
+		paving_grasp,
+		paving_directions,
 		interactive,
 		mode_export,
 		verbose,
@@ -86,7 +95,8 @@ struct Argument
 	static double
 		Pc,
 		Pm,
-		alpha;
+		alpha,
+		paving_alpha;
 
 	// Identifiers
 	enum
@@ -96,7 +106,11 @@ struct Argument
 		id_num_generations,
 		id_Pc,
 		id_Pm,
-		id_alpha
+		id_num_directions,
+		id_alpha,
+		id_search_depth,
+		id_paving_alpha,
+		id_paving_directions
 	};
 
 	// Instance file name

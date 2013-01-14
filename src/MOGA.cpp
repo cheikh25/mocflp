@@ -18,11 +18,12 @@
  #Non-free versions of BiUFLv2012 are available under terms different from those of the General Public License. (e.g. they do not require you to accompany any object code using BiUFLv2012 with the corresponding source code.) For these alternative terms you must purchase a license from Technology Transfer Office of the University of Nantes. Users interested in such a license should contact us (valorisation@univ-nantes.fr) for more information.
  */
 
+// Macro constant which checks solutions from zero (slower)
+#define STRICT_CHECK 0
+
 #include "MOGA.hpp"
-#include "Argument.hpp"
-#include <algorithm>
+#include "LocalSearch.hpp"
 #include <limits>
-#include <cstdlib>
 #include <cstdio>
 
 // To sort individuals by rank and crowding.
@@ -30,7 +31,12 @@ struct compare_ranking
 {
 	bool operator () ( const individual & i1, const individual & i2 ) const
 	{
-		if ( i1.rank < i2.rank ) return true;
+		bool feas1 = i1.is_feasible(),
+		     feas2 = i2.is_feasible();
+
+		if ( feas1 && !feas2 ) return true;
+		else if ( feas2 && !feas1 ) return false;
+		else if ( i1.rank < i2.rank ) return true;
 		else if ( i2.rank < i1.rank ) return false;
 		else if ( i2.crowding < i1.crowding ) return true;
 		else if ( i1.crowding < i2.crowding ) return false;
@@ -144,16 +150,35 @@ void MOGA::compute()
 		print();
 	}
 
+	// LOCAL SEARCH
+	solutions_.clear();
+	if ( Argument::local_search )
+	{
+		LocalSearch local( data_, cust_, fac_ );
+		local.pipe_fp_ = pipe_fp_;
+
+		for ( unsigned int i = 0; i < population_.size(); ++i )
+		{
+			local.search( population_[i] );
+			solutions_.merge( local.solutions_ );
+		}
+	}
+
 	// FINISHED - KEEP BEST VALUES
 
 	// Keep only "first rank" solutions.
-	solutions_.clear();
 	for ( unsigned int i = 0; i < population_.size(); ++i )
 	{
-		if ( population_[i].rank == 1 )
+#if STRICT_CHECK
+		if ( population_[i].rank == 1 && is_feasible( population_[i] ) && population_[i].is_feasible() )
+#else
+		if ( population_[i].rank == 1 && population_[i].is_feasible() )
+#endif
 		{
-			// Check objective and constraints
+#if STRICT_CHECK
+			// Check objective
 			is_valid( population_[i] );
+#endif
 
 			Solution sol( getNbObjective() );
 			for ( int k = 0; k < getNbObjective(); ++k )
@@ -171,24 +196,124 @@ void MOGA::initialization()
 	population_.clear();
 	for ( int i = 0; i < num_individuals_; ++i )
 	{
-		individual ind( getNbObjective(), num_bits_ );
-		ind.obj = originZ_;
-
-		// Select one assignment per customer.
-		for ( unsigned int c = 0; c < cust_.size(); ++c )
+		if ( Argument::grasp )
 		{
-			int f = std::rand() % fac_.size();
-			int begin = c * fac_.size();
-
-			ind.chr[begin + f] = true;
-			add_cost( ind, c, f ); // Add costs
+			population_.push_back( initialization_grasp( Argument::alpha ) );
 		}
-
-		population_.push_back( ind );
+		else
+		{
+			population_.push_back( initialization_random() );
+		}
 	}
 
 	// Compute all rank and crowding.
 	compute_ranking();
+}
+
+individual MOGA::initialization_random() const
+{
+	individual ind( this );
+
+	// Select one assignment per customer.
+	for ( unsigned int c = 0; c < cust_.size(); ++c )
+	{
+		int f = std::rand() % fac_.size();
+		assign( ind, c, f ); // Add costs
+	}
+	return ind;
+}
+
+individual MOGA::initialization_grasp( double alpha ) const
+{
+	individual ind( this );
+	std::vector<int> p( cust_.size(), 0 );
+	std::vector<double> u( fac_.size(), 0 );
+	double umin, umax, ulimit, dir( 0.5 );
+	int d( 0 );
+
+	// Choose a direction (bi-objective)
+	if ( Argument::num_directions > 1 )
+	{
+		d = std::rand() % Argument::num_directions;
+		dir = (double)d / (Argument::num_directions - 1.);
+	}
+
+	// Initialize a random permutation to select customers in a random order (inside-out Fisher-Yates shuffle)
+	for ( unsigned int i = 0; i < p.size(); ++i )
+	{
+		int j = std::rand() % (i+1);
+		p[i] = p[j];
+		p[j] = i;
+	}
+
+	for ( unsigned int i = 0; i < p.size(); ++i )
+	{
+		std::vector<int> RCL;
+		int c( p[i] ), r;
+
+		// Compute utility
+		grasp_compute_utility( c, ind, u, umin, umax, dir );
+		ulimit = umin + alpha * ( umax - umin );
+
+		// Build RCL
+		for ( unsigned int f = 0; f < fac_.size(); ++f )
+		{
+			if ( u[f] >= ulimit )
+			{
+				RCL.push_back( f );
+			}
+		}
+
+		// Select an assignment
+		r = std::rand() % RCL.size();
+		assign( ind, c, RCL[r] ); // Add costs
+	}
+	return ind;
+}
+
+void MOGA::grasp_compute_utility( int c, const individual & ind, std::vector<double> & u, double & umin, double & umax, double dir ) const
+{
+	double demand_c( data_.getCustomer(cust_[c]).getDemand() );
+
+	umin = std::numeric_limits<double>::infinity();
+	umax = -std::numeric_limits<double>::infinity();
+
+	for ( unsigned int f = 0; f < fac_.size(); ++f )
+	{
+		double cost_f     = 0,
+		       capacity_f = ind.q[f];
+
+		if ( Argument::num_directions > 0 && getNbObjective() == 2 )
+		{
+			// Assume we have two objectives
+			cost_f =    dir     * data_.getAllocationObjCost(0, cust_[c], fac_[f])
+			       + (1. - dir) * data_.getAllocationObjCost(1, cust_[c], fac_[f]);
+		}
+		else
+		{
+			// For more objectives, sum of costs
+			for ( int k = 0; k < getNbObjective(); ++k )
+			{
+				cost_f += data_.getAllocationObjCost(k, cust_[c], fac_[f]);
+			}
+		}
+
+		// Add a tiny value to prevent division by zero
+		cost_f += std::numeric_limits<double>::epsilon();
+
+		if ( Argument::capacitated )
+		{
+			u[f] = ( capacity_f - demand_c ) / cost_f;
+		}
+		else
+		{
+			u[f] = 1. / cost_f;
+		}
+
+		// Warning: Negative utilities will give unfeasible solutions
+		umin = std::min( u[f], umin );
+		umax = std::max( u[f], umax );
+	}
 }
 
 std::pair<int, int> MOGA::selection()
@@ -208,8 +333,8 @@ std::pair<int, int> MOGA::selection()
 
 std::pair<individual, individual> MOGA::crossover( const individual & i1, const individual & i2 ) const
 {
-	individual c1( getNbObjective(), num_bits_ ),
-	           c2( getNbObjective(), num_bits_ );
+	individual c1( this ),
+	           c2( this );
 
 	int p = std::rand() % num_bits_;
 
@@ -232,49 +357,78 @@ void MOGA::mutation( individual & ind ) const
 	int p = std::rand() % num_bits_;
 	index_to_cust_fac( p, c, f ); // Retrieve corresponding customer and facility for index p.
 
-	ind.chr[p].flip();
-
-	if ( ind.chr[p] ) add_cost( ind, c, f ); // Add costs
-	else              subtract_cost( ind, c, f ); // Subtract costs
+	// Partial evaluation
+	if ( ind.chr[p] ) unassign( ind, c, f ); // Subtract costs
+	else              assign( ind, c, f );   // Add costs
 }
 
 void MOGA::repair( individual & ind ) const
 {
+	// Save assignments into an integer (indices) vector
+	std::vector<unsigned int> assignment( cust_.size() );
+
 	// For each customer, test if there is one assignement alone or not.
 	for ( unsigned int c = 0; c < cust_.size(); ++c )
 	{
-		int begin = c * fac_.size();
-		std::vector<int> assigned;
+		std::vector<int> list_assigned;
 
 		// Retrieve assignments for customer c
 		for ( unsigned int f = 0; f < fac_.size(); ++f )
 		{
-			if ( ind.chr[begin + f] )
+			if ( ind.chr[ index_of(c, f) ] )
 			{
-				assigned.push_back(f);
+				list_assigned.push_back(f);
 			}
 		}
 
 		// If there are more assignments, select one
-		if ( assigned.size() > 1 )
+		if ( list_assigned.size() > 1 )
 		{
-			unsigned int r = std::rand() % assigned.size();
-			for ( unsigned int i = 0; i < assigned.size(); ++i )
+			unsigned int r = std::rand() % list_assigned.size();
+			for ( unsigned int i = 0; i < list_assigned.size(); ++i )
 			{
 				if ( i != r )
 				{
-					int f = assigned[i];
-					ind.chr[begin + f] = false;
-					subtract_cost( ind, c, f ); // Subtract costs
+					int f = list_assigned[i];
+					unassign( ind, c, f ); // Subtract costs
 				}
 			}
+			assignment[c] = list_assigned[r];
 		}
 		// If no assignment, select one
-		else if ( assigned.size() < 1 )
+		else if ( list_assigned.size() < 1 )
 		{
 			int f = std::rand() % fac_.size();
-			ind.chr[begin + f] = true;
-			add_cost( ind, c, f ); // Add costs
+			assign( ind, c, f ); // Add costs
+			assignment[c] = f;
+		}
+		// One assignment: OK but save it
+		else
+		{
+			assignment[c] = list_assigned[0];
+		}
+	}
+
+	// Search for violated capacities
+	if ( Argument::capacitated )
+	{
+		// Find facilities for which capacity is violated
+		for ( unsigned int f = 0; f < fac_.size(); ++f )
+		{
+			for ( unsigned int c = 0; ind.q[f] < 0 && c < assignment.size(); ++c )
+			{
+				// Find customers that cause capacity to be violated
+				for ( unsigned int g = 0; assignment[c] == f && ind.q[f] < 0 && g < fac_.size(); ++g )
+				{
+					// Try to assign the customer to an other facility
+					if ( ind.q[g] >= data_.getCustomer(cust_[c]).getDemand() )
+					{
+						unassign(ind, c, f);
+						assign(ind, c, g);
+						assignment[c] = g;
+					}
+				}
+			}
 		}
 	}
 }
@@ -285,7 +439,7 @@ void MOGA::elitism()
 	compute_ranking();
 
 	// Erase all individuals that are in the bottom.
-	population_.resize( num_individuals_, individual( getNbObjective(), num_bits_ ) );
+	population_.resize( num_individuals_, individual( this ) );
 
 	// Re-Compute all rank and crowding.
 	compute_ranking();
@@ -293,26 +447,41 @@ void MOGA::elitism()
 
 int MOGA::battle( int i1, int i2 ) const
 {
-	if ( population_[i1].rank < population_[i2].rank ) return i1;
+	bool feas1 = population_[i1].is_feasible(),
+	     feas2 = population_[i2].is_feasible();
+
+	if ( feas1 && !feas2 ) return i1;
+	else if ( feas2 && !feas1 ) return i2;
+	else if ( population_[i1].rank < population_[i2].rank ) return i1;
 	else if ( population_[i2].rank < population_[i1].rank ) return i2;
 	else if ( population_[i2].crowding < population_[i1].crowding ) return i1;
 	else if ( population_[i1].crowding < population_[i2].crowding ) return i2;
 	else return ( std::rand() % 2 ) ? i1 : i2;
 }
 
-void MOGA::add_cost( individual & ind, int c, int f ) const
+void MOGA::assign( individual & ind, int c, int f ) const
 {
-	for ( int k = 0; k < getNbObjective(); ++k )
+	if ( !ind.chr[ index_of(c, f) ] )
 	{
-		ind.obj[k] += data_.getAllocationObjCost(k, cust_[c], fac_[f]);
+		ind.chr[ index_of(c, f) ] = true;
+		for ( int k = 0; k < getNbObjective(); ++k )
+		{
+			ind.obj[k] += data_.getAllocationObjCost(k, cust_[c], fac_[f]);
+		}
+		ind.q[f] -= data_.getCustomer(cust_[c]).getDemand();
 	}
 }
 
-void MOGA::subtract_cost( individual & ind, int c, int f ) const
+void MOGA::unassign( individual & ind, int c, int f ) const
 {
-	for ( int k = 0; k < getNbObjective(); ++k )
+	if ( ind.chr[ index_of(c, f) ] )
 	{
-		ind.obj[k] -= data_.getAllocationObjCost(k, cust_[c], fac_[f]);
+		ind.chr[ index_of(c, f) ] = false;
+		for ( int k = 0; k < getNbObjective(); ++k )
+		{
+			ind.obj[k] -= data_.getAllocationObjCost(k, cust_[c], fac_[f]);
+		}
+		ind.q[f] += data_.getCustomer(cust_[c]).getDemand();
 	}
 }
 
@@ -412,15 +581,15 @@ bool MOGA::dominates( const individual & i1, const individual & i2 ) const
 	return result;
 }
 
-void MOGA::index_to_cust_fac( int p, int & c, int & f ) const
-{
-	std::div_t d = std::div( p, fac_.size() );
-	c = d.quot;
-	f = d.rem;
-}
-
 void MOGA::recompute_obj( individual & ind ) const
 {
+	// Reset residual capacities
+	for ( unsigned int f = 0; f < fac_.size(); ++f )
+	{
+		ind.q[f] = data_.getFacility(fac_[f]).getCapacity();
+	}
+
+	// Reset objectives
 	ind.obj = originZ_;
 	for ( unsigned int p = 0; p < ind.chr.size(); ++p )
 	{
@@ -428,9 +597,64 @@ void MOGA::recompute_obj( individual & ind ) const
 		{
 			int c, f;
 			index_to_cust_fac( p, c, f );
-			add_cost( ind, c, f );
+
+			for ( int k = 0; k < getNbObjective(); ++k )
+			{
+				ind.obj[k] += data_.getAllocationObjCost(k, cust_[c], fac_[f]);
+			}
+
+			ind.q[f] -= data_.getCustomer(cust_[c]).getDemand();
 		}
 	}
+}
+
+bool MOGA::is_feasible( const individual & ind ) const
+{
+	// For each customer, test if there is one assignement alone or not.
+	for ( unsigned int c = 0; c < cust_.size(); ++c )
+	{
+		// Count assignments for customer c
+		int num_assigned = std::count(
+			ind.chr.begin() + index_of( c, 0 ),
+			ind.chr.begin() + index_of( c+1, 0 ),
+			true );
+
+		if ( num_assigned > 1 )
+		{
+			std::cerr << "Error: too many assignments for a customer, " << num_assigned << " counted" << std::endl;
+			return false;
+		}
+		else if ( num_assigned < 1 )
+		{
+			std::cerr << "Error: no assignment for a customer, " << num_assigned << " counted" << std::endl;
+			return false;
+		}
+	}
+
+	// Test if demands fit to capacities
+	if ( Argument::capacitated )
+	{
+		for ( unsigned int f = 0; f < fac_.size(); ++f )
+		{
+			double capacity( data_.getFacility(fac_[f]).getCapacity() ),
+			       demand( 0 );
+
+			for ( unsigned int c = 0; c < cust_.size(); ++c )
+			{
+				if ( ind.chr[ index_of(c, f) ] )
+				{
+					demand += data_.getCustomer(cust_[c]).getDemand();
+				}
+			}
+
+			if ( ind.q[f] != ( capacity - demand ) )
+				std::cerr << "Error: expected residual capacity: " << (capacity - demand) << ", computed: " << ind.q[f] << std::endl;
+
+			if ( demand > capacity )
+				return false;
+		}
+	}
+	return true;
 }
 
 bool MOGA::is_valid( individual & ind ) const
@@ -449,76 +673,90 @@ bool MOGA::is_valid( individual & ind ) const
 		}
 	}
 
-	// For each customer, test if there is one assignement alone or not.
-	for ( unsigned int c = 0; c < cust_.size(); ++c )
-	{
-		// Count assignments for customer c
-		int num_assigned = std::count(
-			ind.chr.begin() + c * fac_.size(),
-			ind.chr.begin() + (c+1) * fac_.size(),
-			true );
-
-		if ( num_assigned > 1 )
-		{
-			std::cerr << "Error: too many assignments for a customer, " << num_assigned << " counted" << std::endl;
-			valid = false;
-		}
-		else if ( num_assigned < 1 )
-		{
-			std::cerr << "Error: no assignment for a customer, " << num_assigned << " counted" << std::endl;
-			valid = false;
-		}
-	}
 	return valid;
 }
 
 void MOGA::print() const
 {
-#if 0
-	if (Argument::verbose)
-	{
-		std::cout << "#### Population ####" << std::endl;
-		for ( unsigned int i = 0; i < population_.size(); ++i )
-		{
-			std::cout << population_[i] << std::endl;
-		}
-		std::cout << "# cust: " << cust_.size() << ", fac: " << fac_.size() << std::endl;
-	}
-#endif
-
 	if (pipe_fp_)
 	{
+		std::vector< std::vector<int> > sol_of_rank;
+		std::vector<bool> feasible( population_.size() );
 		int rank_max( 0 );
+		bool plotted_before( false );
 
+		// Compute feasibility and rank max
 		for ( unsigned int i = 0; i < population_.size(); ++i )
 		{
+			feasible[i] = population_[i].is_feasible();
 			rank_max = std::max( population_[i].rank, rank_max );
 		}
 
-		fputs( "plot ", pipe_fp_ );
-
-		for ( int r = rank_max; r > 1; --r )
+		// Sort population into subpopulations of same rank
+		sol_of_rank.resize( rank_max+1 );
+		for ( unsigned int i = 0; i < population_.size(); ++i )
 		{
-			fprintf( pipe_fp_, "'-' title '%d', ", r );
-		}
-		fputs( "'-' title '1' linecolor rgb 'blue' pt 9\n", pipe_fp_ );
-
-		for ( int r = rank_max; r >= 1; --r )
-		{
-			for ( unsigned int i = 0; i < population_.size(); ++i )
+			if ( feasible[i] && population_[i].rank > 0 )
 			{
-				if ( population_[i].rank == r )
+				sol_of_rank[population_[i].rank-1].push_back( i );
+			}
+			else
+			{
+				sol_of_rank[rank_max].push_back( i );
+			}
+		}
+
+		// Begin plot
+		std::fputs( "plot ", pipe_fp_ );
+
+		// Show the infeasible solutions in background
+		if ( sol_of_rank[rank_max].size() > 0 )
+		{
+			std::fputs( "'-' title 'infeasible' linecolor rgb 'turquoise' pt 9", pipe_fp_ );
+			plotted_before = true;
+		}
+
+		// Show the feasible solutions of rank > 1
+		for ( unsigned int r = rank_max-1; r > 0; --r )
+		{
+			if ( sol_of_rank[r].size() > 0 )
+			{
+				if ( plotted_before == true )
+					std::fputs( ", ", pipe_fp_ );
+
+				std::fprintf( pipe_fp_, "'-' title '%d'", r );
+				plotted_before = true;
+			}
+		}
+
+		// Show the feasible solutions of rank 1 in foreground
+		if ( sol_of_rank[0].size() > 0 )
+		{
+			if ( plotted_before == true )
+				std::fputs( ", ", pipe_fp_ );
+
+			std::fputs( "'-' title '1' linecolor rgb 'blue' pt 9", pipe_fp_ );
+		}
+		std::fputs( "\n", pipe_fp_ );
+
+		// Transfer points
+		for ( int r = rank_max; r >= 0; --r )
+		{
+			if ( sol_of_rank[r].size() > 0 )
+			{
+				for ( unsigned int i = 0; i < sol_of_rank[r].size(); ++i )
 				{
 					for ( int k = 0; k < getNbObjective(); ++k )
 					{
-						fprintf( pipe_fp_, "%f ", population_[i].obj[k] );
+						std::fprintf( pipe_fp_, "%f ", population_[sol_of_rank[r][i]].obj[k] );
 					}
-					fputs( "\n", pipe_fp_ );
+					std::fputs( "\n", pipe_fp_ );
 				}
+				std::fputs( "e\n", pipe_fp_ );
 			}
-			fputs( "e\n", pipe_fp_ );
 		}
-		fputs( "\n", pipe_fp_ );
+
+		std::fputs( "\n", pipe_fp_ );
 	}
 }
 
@@ -529,9 +767,17 @@ std::ostream & operator << ( std::ostream & os, const individual & ind )
 	{
 		os << ind.obj[k] << ' ';
 	}
-	for ( unsigned int i = 0; i < ind.chr.size(); ++i )
+
+	unsigned int ncust = ind.chr.size() / ind.q.size();
+	for ( unsigned int i = 0; i < ncust; ++i )
 	{
-		os << ind.chr[i];
+		if ( i > 0 )
+			os << '|';
+
+		for ( unsigned int j = 0; j < ind.q.size(); ++j )
+		{
+			os << ind.chr[i * ind.q.size() + j];
+		}
 	}
 	return os;
 }

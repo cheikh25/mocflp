@@ -186,6 +186,12 @@ public:
 	void computeBox();
 
 	/*!
+	*	\brief A method to know if a \c Box can be feasible or not (check constraints).
+	*	\return A boolean which value is TRUE if the \c Box can be feasible.
+	*/
+	bool isFeasible() const;
+
+	/*!
 	*	\brief A method that opens a \c Facility in this \c Box, by adding all the location cost of the two objectives.
 	*	\param[in] fac : A \c Facility to open.
 	*/
@@ -194,9 +200,29 @@ public:
 	/*!
 	*	\brief A method to print informations about this \c Box.
 	*/
-	void print();	
+	void print();
 
 private:
+	/*!
+	*	\brief Compute the box efficiently for UFLP.
+	*/
+	void computeBoxUFLP();
+
+	/*!
+	*	\brief Compute the box using an heuristic.
+	*/
+	void computeBoxHeuristic();
+
+	/*!
+	*	\brief Compute the box using a lagrangian relaxation algorithm.
+	*/
+	void computeBoxLagrangian();
+
+	/*!
+	*	\brief Compute the box using a mono-objective MIP solver.
+	*/
+	void computeBoxMIP();
+
 	std::string id_;/*!< A string which represents the id of this \c Box */
 
 	Data& data_;/*!< A reference to the \c Data of this \c Box */
@@ -207,6 +233,8 @@ private:
 	bool hasNeighbor_;/*!< A boolean which represents if this \c Box has a neighboor or not */
 
 	int nbCustomerNotAffected_; /*!< An integer which represents the number of \c Customer not affected of this \c Box*/
+
+	double totalCapacity_;/*!< A double which represents total capacities of all open facilities this \c Box */
 
 	std::vector<double> minZ_;/*!< A double which represents the minimum value w.r.t. objective k*/
 	std::vector<double> maxZ_;/*!< A double which represents the maximum value w.r.t. objective k*/

@@ -21,23 +21,65 @@
 #include "Functions.hpp"
 #include "MOGA.hpp"
 #include "Argument.hpp"
+#include <algorithm>
 #include <limits>
 #include <cstdio>
+
+// Functor to sort an index array (of facilities) by decreasing capacity
+struct compare_capacity
+{
+	compare_capacity(Data &data) : data_(data) {}
+	bool operator() ( int i, int j ) const
+	{
+		return data_.getFacility(i).getCapacity() > data_.getFacility(j).getCapacity();
+	}
+	Data &data_;
+};
+
+// Functor to generate the identity permutation in a vector
+struct generate_identity
+{
+	generate_identity() : i_(0) {}
+	int operator() () { return i_++; }
+	int i_;
+};
 
 long int createBox(std::vector<Box*> &vectorBox, Data &data)
 {
 	long int nbBoxComputed = 0;
-		
-	//Add the first boxes with only one facility opened
-	Box *box0 = new Box(data);
-	addChildren(box0, vectorBox);
-	delete box0;
+
+	// Make a list of indices of facilities and sort them
+	std::vector<int> sorted_fac( data.getnbFacility() );
+
+	// sorted_fac = 0...n-1
+	std::generate( sorted_fac.begin(), sorted_fac.end(), generate_identity() );
+
+	// Compute Box list using a GRASP (for capacitated)
+	if ( Argument::capacitated && Argument::paving_grasp )
+	{
+		initBoxCapacitated(vectorBox, data, sorted_fac);
+	}
+	// Add the first boxes with only one facility opened (for uncapacitated)
+	else
+	{
+		Box *box0 = new Box(data);
+		addChildren(box0, vectorBox, sorted_fac);
+		delete box0;
+	}
 	
 	for (unsigned int it = 0; it < vectorBox.size();)
 	{
 		++nbBoxComputed;
+
+		// If the box gives an unfeasible subproblem
+		if ( !vectorBox[it]->isFeasible() )
+		{
+			addChildren(vectorBox[it], vectorBox, sorted_fac);
+			delete vectorBox[it];
+			vectorBox.erase(vectorBox.begin() + it);
+		}
 		//If the box is dominated by its origin by all the existing boxes
-		if ( isDominatedByItsOrigin(vectorBox, vectorBox[it]) )
+		else if ( isDominatedByItsOrigin(vectorBox, vectorBox[it]) )
 		{
 			delete vectorBox[it];
 			vectorBox.erase(vectorBox.begin() + it);
@@ -45,7 +87,7 @@ long int createBox(std::vector<Box*> &vectorBox, Data &data)
 		else
 		{
 			//Compute all potential children of this box as candidates boxes
-			addChildren(vectorBox[it], vectorBox);
+			addChildren(vectorBox[it], vectorBox, sorted_fac);
 			//Compute bounds of this box
 			vectorBox[it]->computeBox();
 			//If this box is dominated by all the boxes (existing + its children) regarding to its bounds
@@ -84,32 +126,180 @@ long int createBox(std::vector<Box*> &vectorBox, Data &data)
 	return nbBoxComputed;
 }
 
-
-void addChildren(Box *boxMother, std::vector<Box*> &vBox)
+void initBoxCapacitated(std::vector<Box*> &vectorBox, Data &data, std::vector<int> & sorted_fac)
 {
-    Data& data = boxMother->getData();
-    
-    //To find the last digit at 1 in the open facility
-    std::vector<bool> facilityOpen(data.getnbFacility());
-    int indexLastOpened = -1;
-    
-    for (unsigned int i = 0 ; i < data.getnbFacility() ; ++i)
-    {
-        if (boxMother->isOpened(i))
-        {
-            indexLastOpened = i;
-        }
-        facilityOpen[i] = boxMother->isOpened(i);
-    }
-    
-    //For each digit 0 of facilities not yet affected, we change it in 1 to create the corresponding a new combination
-    for (unsigned int i = indexLastOpened + 1 ; i < data.getnbFacility() ; ++i)
-    {
-        facilityOpen[i] = true;
-        Box *tmp = new Box(data, facilityOpen);
-        vBox.push_back(tmp);		
-        facilityOpen[i] = false;
-    }
+	// sorted_fac is sorted by decreasing capacities
+	std::sort( sorted_fac.begin(), sorted_fac.end(), compare_capacity(data) );
+
+	// Compute the total demand
+	double dtotal( 0 );
+	for ( unsigned int i = 0; i < data.getnbCustomer(); ++i )
+	{
+		dtotal += data.getCustomer(i).getDemand();
+	}
+
+	// Compute the minimum number of facilities to open (left).
+	double qminsum( 0 );
+	unsigned int minfac( 0 );
+	while ( minfac < sorted_fac.size() && qminsum < dtotal )
+	{
+		qminsum += data.getFacility(sorted_fac[minfac]).getCapacity();
+		++minfac;
+	}
+
+	// Check if the problem can be feasible
+	if ( qminsum < dtotal )
+	{
+		std::cerr << "The problem is infeasible !" << std::endl;
+		return;
+	}
+
+	// Compute the minimum number of facilities to open (right).
+	double qmaxsum( 0 );
+	unsigned int maxfac( sorted_fac.size() );
+	while ( maxfac >= 0 && qmaxsum < dtotal )
+	{
+		--maxfac;
+		qmaxsum += data.getFacility(sorted_fac[maxfac]).getCapacity();
+	}
+
+	for ( int it = 0; it < Argument::paving_directions; ++it )
+	{
+		// GRASP
+		std::vector<bool> facilityOpen(data.getnbFacility(), false);
+		std::vector<int> not_open( sorted_fac );
+		double qsum( 0 ), alpha( 0.5 ),
+		       dir( (double)it / (double)(Argument::paving_directions - 1.) );
+
+		while ( qsum < dtotal )
+		{
+			std::vector<double> u( not_open.size() );
+			std::vector<int> RCL;
+			double umin( std::numeric_limits<double>::infinity() ),
+			       umax( -std::numeric_limits<double>::infinity() ),
+			       ulimit;
+
+			// Build utility function
+			for ( unsigned int j = 0; j < not_open.size(); ++j )
+			{
+				double cost( 0 );
+				if ( data.getNbObjective() > 2 )
+				{
+					for ( int k = 0; k < data.getNbObjective(); ++k )
+					{
+						cost += data.getFacility( not_open[j] ).getLocationObjCost( k );
+					}
+				}
+				else
+				{
+					cost = dir * data.getFacility( not_open[j] ).getLocationObjCost( 0 )
+					 + ( 1. - dir ) * data.getFacility( not_open[j] ).getLocationObjCost( 1 );
+				}
+
+				u[j] = data.getFacility( not_open[j] ).getCapacity() / cost;
+				if ( u[j] < umin ) umin = u[j];
+				if ( u[j] > umax ) umax = u[j];
+			}
+			ulimit = umin + alpha * ( umax - umin );
+
+			// Build RCL
+			for ( unsigned int j = 0; j < u.size(); ++j )
+			{
+				if ( u[j] >= ulimit )
+				{
+					RCL.push_back( j );
+				}
+			}
+
+			// Select a random facility
+			int r = std::rand() % RCL.size();
+
+			// Open it
+			facilityOpen[not_open[RCL[r]]] = true;
+			qsum += data.getFacility( not_open[RCL[r]] ).getCapacity();
+			not_open.erase( not_open.begin() + RCL[r] );
+		}
+		vectorBox.push_back( new Box(data, facilityOpen) );
+	}
+}
+
+void addChildren(Box *boxMother, std::vector<Box*> &vBox, const std::vector<int> & sorted_fac)
+{
+	Data& data = boxMother->getData();
+
+	// To find the last digit at 1 in the open facility
+	std::vector<bool> facilityOpen(data.getnbFacility());
+	int indexLastOpened = -1;
+
+	double qsum( 0 );
+	static std::vector<double> qremaining( data.getnbFacility(), 0 );
+	static double dtotal( -1 );
+
+	// Compute some data (once)
+	if ( Argument::capacitated && !Argument::paving_grasp && dtotal < 0 )
+	{
+		// Compute the total demand (once)
+		dtotal = 0;
+		for ( unsigned int i = 0; i < data.getnbCustomer(); ++i )
+		{
+			dtotal += data.getCustomer(i).getDemand();
+		}
+
+		// Compute the remaining capacities (once)
+		for ( unsigned int i = data.getnbFacility()-1; i > 0; --i )
+		{
+			qremaining[i-1] = qremaining[i] + data.getFacility(sorted_fac[i]).getCapacity();
+		}
+	}
+
+	// Compute the facilityOpen vector of the current Box
+	for (unsigned int i = 0 ; i < data.getnbFacility() ; ++i)
+	{
+		if (boxMother->isOpened(sorted_fac[i]))
+		{
+			indexLastOpened = i;
+			qsum += data.getFacility(sorted_fac[i]).getCapacity();
+		}
+		facilityOpen[sorted_fac[i]] = boxMother->isOpened(sorted_fac[i]);
+	}
+
+	// If Box was constructed using GRASP heuristic
+	if ( Argument::capacitated && Argument::paving_grasp )
+	{
+		for (unsigned int i = 0 ; i < data.getnbFacility() ; ++i)
+		{
+			if (!facilityOpen[sorted_fac[i]])
+			{
+				facilityOpen[sorted_fac[i]] = true;
+				vBox.push_back( new Box(data, facilityOpen) );
+				facilityOpen[sorted_fac[i]] = false;
+			}
+		}
+	}
+	else // Enumerate all (extremely slow if capacitated)
+	{
+		// For each digit 0 of facilities not yet affected, we change it in 1 to create the corresponding a new combination
+		for (unsigned int i = indexLastOpened + 1; i < data.getnbFacility(); ++i)
+		{
+			// If the remaining facilites exactly cover the rest of the demand,
+			// Skip infeasible boxes
+			if ( Argument::capacitated && qsum + qremaining[i] < dtotal )
+			{
+				while ( i < data.getnbFacility() )
+				{
+					facilityOpen[sorted_fac[i]] = true;
+					++i;
+				}
+				vBox.push_back( new Box(data, facilityOpen) );
+			}
+			else
+			{
+				facilityOpen[sorted_fac[i]] = true;
+				vBox.push_back( new Box(data, facilityOpen) );
+				facilityOpen[sorted_fac[i]] = false;
+			}
+		}
+	}
 }
 
 void filter(std::vector<Box*> &vectorBox, long int &nbToCompute, long int &nbWithNeighbor)
@@ -332,10 +522,8 @@ void weightedSumOneStep(std::vector<Box*> &vectorBox, Data &data)
 }
 
 //LABELSETTING
-long int runLabelSetting(std::vector<Box*> &vectorBox, Data &data)
+long int runLabelSetting(std::vector<Box*> &vectorBox, Data &data, std::list<Solution> & allSolution)
 {
-	std::list<Solution> allSolution;
-	std::list<Solution>::iterator it;
 	std::vector<Box*>::iterator itVector;
 	for (itVector = vectorBox.begin(); itVector != vectorBox.end(); ++itVector)
 	{						
@@ -356,10 +544,8 @@ long int runLabelSetting(std::vector<Box*> &vectorBox, Data &data)
 }
 
 // Multi-objective genetic algorithm
-long int runMOGA(std::vector<Box*> &vectorBox, Data &data)
+long int runMOGA(std::vector<Box*> &vectorBox, Data &data, std::list<Solution> & allSolution)
 {
-	std::list<Solution> allSolution;
-	std::list<Solution>::iterator it;
 	std::vector<Box*>::iterator itVector;
 	FILE * pipe_fp = 0; // Gnuplot pipe
 	int object_id = 0;
@@ -367,7 +553,7 @@ long int runMOGA(std::vector<Box*> &vectorBox, Data &data)
 	// OPEN GNUPLOT (interactive mode)
 	if (Argument::interactive)
 	{
-		if ( ( pipe_fp = popen("gnuplot -persistent", "w") ) != 0 )
+		if ( ( pipe_fp = popen("gnuplot", "w") ) != 0 )
 		{
 			int num_obj = (*vectorBox.begin())->getNbObjective();
 			std::vector<double> minZ( num_obj, std::numeric_limits<double>::infinity() ),
